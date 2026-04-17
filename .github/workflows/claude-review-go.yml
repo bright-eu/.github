@@ -68,7 +68,6 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
-          show_full_output: true
           prompt: |
             Review this Go PR following this EXACT workflow:
 
