@@ -1,0 +1,142 @@
+name: Claude PR Review (Go)
+
+on:
+  workflow_call:
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: |
+      github.event.pull_request.draft != true &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'dependencies') &&
+      !contains(github.event.pull_request.labels.*.name, 'bot')
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BRIGHT_CLAUDE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.BRIGHT_CLAUDE_GITHUB_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Fetch modern-go-guidelines plugin
+        env:
+          MODERN_GO_GUIDELINES_SHA: ebf0aa738bb6cc0a9127131e2ea7b24c660e1428
+        run: |
+          git clone https://github.com/JetBrains/go-modern-guidelines.git /tmp/go-modern-guidelines
+          git -C /tmp/go-modern-guidelines checkout "$MODERN_GO_GUIDELINES_SHA"
+
+      - name: Check PR Size
+        id: pr-size
+        run: |
+          CHANGED_FILES=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --json changedFiles -q '.changedFiles')
+
+          echo "Changed files: $CHANGED_FILES"
+
+          if [ "$CHANGED_FILES" -gt 50 ]; then
+            echo "PR too large ($CHANGED_FILES files). Skipping automated review." >> $GITHUB_STEP_SUMMARY
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Claude PR Review
+        id: claude-review
+        if: steps.pr-size.outputs.skip != 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        timeout-minutes: 5
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          show_full_output: true
+          prompt: |
+            Review this Go PR following this EXACT workflow:
+
+            STEP 1: Check existing reviews using mcp__github__get_pull_request_reviews
+            - Look for any review containing "LGTM" from the bot
+            - If found AND you have no new issues to report, STOP HERE - do not submit review
+
+            STEP 2: Get the full diff using mcp__github__get_pull_request_diff
+            - Paginate if needed for large PRs
+            - Analyze all changes thoroughly
+
+            STEP 3: Verification
+            - Duplicate or similar issues from previous reviews should NOT be reported again
+            - For each potential issue, re-examine the code context
+            - Only report issues you can verify with specific line references
+
+            STEP 4: If and only if you found issues:
+            - Start pending review: mcp__github__create_pending_pull_request_review
+            - Add inline comments: mcp__github__add_comment_to_pending_review (for each issue)
+            - Submit review: mcp__github__submit_pending_pull_request_review with event="COMMENT"
+
+            GO-SPECIFIC REVIEW FOCUS:
+            - Error handling: Check errors are not ignored, wrapped properly with context
+            - Resource leaks: Ensure defer for Close(), proper cleanup of resources
+            - Race conditions: Look for shared state access without proper synchronization
+            - Context propagation: Verify ctx is passed through and timeouts respected
+            - SpiceDB patterns: Bidirectional relationships for member domains, outbox atomicity
+            - Nil pointer dereferences: Check pointer access after error returns
+            - SQL injection: Verify parameterized queries, no string concatenation
+            - Modern Go: Flag outdated patterns that have modern replacements compatible
+              with the project's Go version (from go.mod). Use the modern-go-guidelines
+              plugin loaded via --plugin-dir as reference. Only flag when there is a
+              concrete modern alternative in the diff.
+            - Reuse: Flag new code that duplicates an existing utility or inline logic
+              that could use one. Only when you can name the existing replacement.
+            - Quality: Flag redundant state, copy-paste blocks, stringly-typed code where
+              a constant exists, and comments that narrate WHAT the code does.
+            - Efficiency: Flag sequential work that could be parallel, N+1 patterns,
+              redundant I/O, and unbounded allocations introduced by the diff.
+
+            EXPLICITLY IGNORE:
+            - Missing tests
+            - Import order/formatting (gofmt handles this)
+            - Positive changes or improvements
+            - Style preferences
+            - Documentation unless critically wrong
+            - golangci-lint issues (separate CI check)
+
+            REVIEW BODY RULES:
+            - If no issues found: Body = "LGTM" (exactly this, nothing else)
+            - If issues found: Body = empty (use inline comments only)
+            - NO summaries, NO bullet points, NO explanations in review body
+
+            INLINE COMMENT RULES:
+            - Be specific about the issue and line number
+            - Provide actionable fix suggestions
+            - Keep comments concise (1-2 sentences max)
+            - Don't repeat comments from previous reviews
+
+            PR CONTEXT:
+            Repository: ${{ github.repository }}
+            PR Number: ${{ github.event.pull_request.number }}
+            Title: ${{ github.event.pull_request.title }}
+
+          claude_args: |
+            --plugin-dir /tmp/go-modern-guidelines/claude/modern-go-guidelines
+            --allowedTools "mcp__github__get_pull_request,mcp__github__create_pending_pull_request_review,mcp__github__add_comment_to_pending_review,mcp__github__submit_pending_pull_request_review,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_review_comments"
+        env:
+          MAX_MCP_OUTPUT_TOKENS: "50000"
+          CLAUDE_MAX_TOKENS: "4000"
+          CLAUDE_MAX_RETRIES: "2"
