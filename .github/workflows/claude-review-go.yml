@@ -90,7 +90,6 @@ jobs:
             - Resource leaks: Ensure defer for Close(), proper cleanup of resources
             - Race conditions: Look for shared state access without proper synchronization
             - Context propagation: Verify ctx is passed through and timeouts respected
-            - SpiceDB patterns: Bidirectional relationships for member domains, outbox atomicity
             - Nil pointer dereferences: Check pointer access after error returns
             - SQL injection: Verify parameterized queries, no string concatenation
             - Modern Go: Flag outdated patterns that have modern replacements compatible
@@ -105,11 +104,9 @@ jobs:
               redundant I/O, and unbounded allocations introduced by the diff.
 
             EXPLICITLY IGNORE:
-            - Missing tests
             - Import order/formatting (gofmt handles this)
             - Positive changes or improvements
             - Style preferences
-            - Documentation unless critically wrong
             - golangci-lint issues (separate CI check)
 
             REVIEW BODY RULES:
