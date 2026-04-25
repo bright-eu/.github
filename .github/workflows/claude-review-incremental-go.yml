@@ -1,0 +1,202 @@
+name: Claude PR Review (Go, Incremental)
+
+on:
+  workflow_call:
+    inputs:
+      before_sha:
+        description: 'PR head SHA before this push (github.event.before)'
+        required: true
+        type: string
+      after_sha:
+        description: 'PR head SHA after this push (github.event.after)'
+        required: true
+        type: string
+
+jobs:
+  review:
+    if: |
+      github.event.pull_request.draft != true &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'dependencies') &&
+      !contains(github.event.pull_request.labels.*.name, 'bot')
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.BRIGHT_CLAUDE_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BRIGHT_CLAUDE_GITHUB_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get incremental diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BEFORE_SHA: ${{ inputs.before_sha }}
+          AFTER_SHA: ${{ inputs.after_sha }}
+        run: |
+          # Skip merge commits — diff would include all of base branch's new history
+          PARENT_COUNT=$(git rev-list --parents -n 1 "$AFTER_SHA" 2>/dev/null | wc -w)
+          PARENT_COUNT=$((PARENT_COUNT - 1))
+          if [ "$PARENT_COUNT" -gt 1 ]; then
+            echo "Merge commit detected ($PARENT_COUNT parents) — skipping incremental review"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Skip if before SHA is the zero/null SHA (first push)
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+            echo "Initial push detected — skipping incremental review (full review handles this)"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          gh api "repos/${{ github.repository }}/compare/$BEFORE_SHA...$AFTER_SHA" \
+            --jq '.files[] | select(.filename | test("\\.(go|mod|sum)$") or startswith(".github/") or startswith(".claude/")) | "--- \(.filename)\n+++ \(.filename)\n\(.patch // "")"' \
+            > /tmp/incremental.diff || true
+
+          if [ -s /tmp/incremental.diff ]; then
+            CHANGED=$(gh api "repos/${{ github.repository }}/compare/$BEFORE_SHA...$AFTER_SHA" --jq '.files | length')
+            echo "Changed files in this push: $CHANGED"
+            if [ "$CHANGED" -gt 50 ]; then
+              echo "Push too large ($CHANGED files). Skipping incremental review." >> $GITHUB_STEP_SUMMARY
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            wc -l /tmp/incremental.diff
+          else
+            echo "No reviewable code changes in this push"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch modern-go-guidelines plugin
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          MODERN_GO_GUIDELINES_SHA: ebf0aa738bb6cc0a9127131e2ea7b24c660e1428
+        run: |
+          git clone https://github.com/JetBrains/go-modern-guidelines.git /tmp/go-modern-guidelines
+          git -C /tmp/go-modern-guidelines checkout "$MODERN_GO_GUIDELINES_SHA"
+
+      - name: Claude PR Review (Incremental)
+        id: claude-review
+        if: steps.diff.outputs.has_changes == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        timeout-minutes: 5
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: |
+            You are reviewing ONLY the changes in the most recent push to this Go PR — not the entire PR.
+            The incremental diff is at /tmp/incremental.diff.
+
+            Follow this EXACT workflow:
+
+            STEP 1: Read /tmp/incremental.diff to see what changed in this push.
+
+            STEP 2: Check existing review threads to avoid duplicate comments:
+            ```bash
+            gh api graphql -f query='
+              query($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        isOutdated
+                        comments(first: 10) {
+                          nodes { body path line author { login } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ' -f owner='${{ github.repository_owner }}' -f repo='${{ github.event.repository.name }}' -F pr=${{ github.event.pull_request.number }}
+            ```
+            - NEVER recreate comments where isResolved=true (human resolved these)
+            - NEVER recreate comments where isOutdated=true (code no longer exists)
+            - Skip if similar feedback already exists at that location
+
+            STEP 3: Analyze the incremental diff for issues. Comment ONLY on lines present in the diff.
+
+            STEP 4: If NO issues found in the incremental diff:
+            - Check if any unresolved threads exist (isResolved=false AND isOutdated=false). If yes → STOP.
+            - Use mcp__github__get_pull_request_reviews to find prior "LGTM" from the bot.
+            - If no prior LGTM exists → submit review with body "LGTM" and event "COMMENT".
+            - If prior LGTM exists AND review comments were posted after it (issues raised + addressed) → submit new "LGTM".
+            - If prior LGTM exists and nothing new since → STOP.
+
+            STEP 5: If issues ARE found:
+            - mcp__github__create_pending_pull_request_review
+            - mcp__github__add_comment_to_pending_review for each issue (line numbers FROM THE DIFF, side: "RIGHT")
+            - mcp__github__submit_pending_pull_request_review with event="COMMENT" (no body)
+
+            GO-SPECIFIC REVIEW FOCUS (for NEW code only):
+            - Error handling: errors not ignored, wrapped with `fmt.Errorf("...: %w", err)`
+            - Resource leaks: defer for Close(), proper cleanup
+            - Race conditions: shared state access without synchronization
+            - Context propagation: ctx passed through, timeouts respected
+            - Nil pointer dereferences after error returns
+            - SQL injection / unsafe string concatenation
+            - Modern Go: outdated patterns with modern replacements compatible with go.mod
+              version. Use the modern-go-guidelines plugin loaded via --plugin-dir. Only
+              flag when a concrete modern alternative applies to the diff.
+            - Reuse: new code duplicating an existing utility — only when you can name the
+              replacement.
+            - Quality: redundant state, copy-paste blocks, stringly-typed code where a
+              constant exists, comments narrating WHAT.
+            - Efficiency: sequential work that could parallel, N+1 patterns, redundant I/O,
+              unbounded allocations.
+
+            EXPLICITLY IGNORE:
+            - Import order / formatting (gofmt)
+            - golangci-lint issues (separate CI check)
+            - Style preferences
+            - Positive changes
+            - Code NOT changed in this push (even if it has issues)
+            - Missing tests
+
+            INLINE COMMENT LINE NUMBERS (CRITICAL — COMMENTS WILL SILENTLY FAIL):
+            - The `line` parameter must be a line number FROM THE DIFF, not the file
+            - Only diff lines (added/modified) can receive comments
+            - Use side: "RIGHT" for new/modified code
+            - Verify the line exists in /tmp/incremental.diff before adding the comment
+
+            REVIEW BODY RULES:
+            - No issues → body "LGTM", event "COMMENT"
+            - Issues → body empty (inline comments only)
+            - NO summaries, NO bullet points, NO top-level commentary
+
+            INLINE COMMENT RULES:
+            - Specific issue + line number
+            - Actionable fix suggestion
+            - 1-2 sentences max
+            - No repetition of prior comments
+
+            PR CONTEXT:
+            Repository: ${{ github.repository }}
+            PR Number: ${{ github.event.pull_request.number }}
+            Title: ${{ github.event.pull_request.title }}
+            Before SHA: ${{ inputs.before_sha }}
+            After SHA: ${{ inputs.after_sha }}
+
+          claude_args: |
+            --plugin-dir /tmp/go-modern-guidelines/claude/modern-go-guidelines
+            --allowedTools "Bash,Read,mcp__github__get_pull_request,mcp__github__create_pending_pull_request_review,mcp__github__add_comment_to_pending_review,mcp__github__submit_pending_pull_request_review,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_review_comments"
+        env:
+          MAX_MCP_OUTPUT_TOKENS: "50000"
+          CLAUDE_MAX_TOKENS: "4000"
+          CLAUDE_MAX_RETRIES: "2"
